@@ -58,7 +58,8 @@ Tables, footnotes, comments, nested lists: deferred past MVP.
 
 **Note:** `id` (uuid) · `title` (auto = first heading/paragraph text, 80 chars, editable) ·
 `body` (doc JSON) · `plaintext` (server-extracted, returned in responses for list snippets) ·
-`folder_id` (nullable) · `tags` (string[]) · `favorite` (bool) ·
+`folder_id` (nullable) · `tags` (string[]) · `favorite` (bool) · `pinned` (bool —
+pinned notes sort first) · `archived` (bool — hidden from the default list) ·
 `revision` (int, +1 per write) · `created_at` / `updated_at` (ISO 8601 UTC) ·
 `deleted_at` (nullable → trash) · `reminder_at` (nullable ISO 8601 UTC —
 a due date/time for the note; notification delivery is client-side in v1).
@@ -80,22 +81,28 @@ a due date/time for the note; notification delivery is client-side in v1).
 - Reminders: any note may carry `reminder_at`. The server stores it and offers
   `has_reminder` / `reminder_before` list filters; actually notifying the user
   is the client's job in v1 (poll due reminders, fire a local notification).
-- Last 50 revisions kept server-side (history UI comes later).
+- Last 50 revisions kept server-side and exposed via the revisions endpoints
+  below (list, fetch one, restore as a new revision — history is never rewritten).
 
 ## 5. Endpoints
 
 - `GET /health` → `{ "ok": true, "version": "0.1.0", "api_version": "0.1" }`
   (`api_version` lets clients detect breaking server changes from auto-update)
-- `GET /api/v1/notes?since=&folder_id=&q=&favorite=&has_reminder=&reminder_before=&limit=&cursor=` — excludes trash by default
-- `POST /api/v1/notes` — `{ title?, body, folder_id?, tags?, reminder_at? }`
+- `GET /api/v1/notes?since=&folder_id=&q=&favorite=&pinned=&archived=&has_reminder=&reminder_before=&limit=&cursor=` — excludes trash by default; archived notes are hidden unless `archived=true`. `q` searches via SQLite FTS5 (relevance-ranked); pinned notes sort first otherwise.
+- `POST /api/v1/notes` — `{ title?, body, folder_id?, tags?, reminder_at?, pinned?, archived? }`
 - `GET /api/v1/notes/{id}`
 - `PUT /api/v1/notes/{id}` — full body replace:
-  `{ title?, body, base_revision, folder_id?, tags?, favorite?, reminder_at? }`.
+  `{ title?, body, base_revision, folder_id?, tags?, favorite?, reminder_at?, pinned?, archived? }`.
   Omitted metadata fields keep their current values (never silently wiped).
 - `PATCH /api/v1/notes/{id}` —
-  `{ title?, folder_id?, tags?, favorite?, reminder_at?, base_revision? }`.
+  `{ title?, folder_id?, tags?, favorite?, reminder_at?, pinned?, archived?, base_revision? }`.
   Explicit `folder_id: null` clears the folder, explicit `reminder_at: null`
   clears the reminder; omitted fields are untouched.
+- `DELETE /api/v1/notes/{id}` — soft delete → trash (`?hard=true` purges)
+- `POST /api/v1/notes/{id}/restore`
+- `GET /api/v1/notes/{id}/revisions` — version history (revision + timestamp)
+- `GET /api/v1/notes/{id}/revisions/{rev}` — one old version's body
+- `POST /api/v1/notes/{id}/revisions/{rev}/restore` — restore as a new revision
 - `DELETE /api/v1/notes/{id}` — soft delete → trash (`?hard=true` purges)
 - `POST /api/v1/notes/{id}/restore`
 - `GET /api/v1/notes/trash?since=&limit=&cursor=`
@@ -103,7 +110,7 @@ a due date/time for the note; notification delivery is client-side in v1).
   `DELETE /api/v1/folders/{id}`
 - `POST /api/v1/attachments` (multipart file) → `{ id, url }`
 - `GET /api/v1/attachments/{id}/file` · `DELETE /api/v1/attachments/{id}`
-- Search via `q` param (plaintext match, `%`/`_` escaped; full-text search later)
+- Search via `q` param (SQLite FTS5, relevance-ranked)
 
 ## 6. Auth
 

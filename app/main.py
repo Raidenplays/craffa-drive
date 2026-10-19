@@ -70,6 +70,8 @@ def note_to_dict(row) -> dict:
         "folder_id": row["folder_id"],
         "tags": json.loads(row["tags"]),
         "favorite": bool(row["favorite"]),
+        "pinned": bool(row["pinned"]),
+        "archived": bool(row["archived"]),
         "revision": row["revision"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -82,10 +84,6 @@ def check_body(body: dict) -> None:
     err = validate_doc(body)
     if err:
         raise HTTPException(422, err)
-
-
-def _like_escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _check_reminder(value: str | None) -> None:
@@ -138,32 +136,51 @@ def list_notes(
     folder_id: str | None = Query(default=None),
     q: str | None = Query(default=None),
     favorite: bool | None = Query(default=None),
+    pinned: bool | None = Query(default=None),
+    archived: bool | None = Query(default=None),
     has_reminder: bool | None = Query(default=None),
     reminder_before: str | None = Query(default=None),
     limit: int = Query(default=50, le=200),
     cursor: int = Query(default=0, ge=0),
 ):
-    sql = "SELECT * FROM notes WHERE deleted_at IS NULL"
+    # Full-text search via FTS5 when q is given (ranked by relevance);
+    # otherwise plain listing, pinned notes first.
     args: list = []
+    if q and q.split():
+        match = " ".join(f'"{t.replace(chr(34), "")}"' for t in q.split())
+        from_clause = "notes n JOIN notes_fts ON notes_fts.rowid = n.rowid"
+        where = ["n.deleted_at IS NULL", "notes_fts MATCH ?"]
+        args.append(match)
+        order = "bm25(notes_fts)"
+        c = lambda name: f"n.{name}"
+    else:
+        from_clause = "notes n"
+        where = ["n.deleted_at IS NULL"]
+        order = "n.pinned DESC, n.updated_at DESC"
+        c = lambda name: f"n.{name}"
     if since:
-        sql += " AND updated_at > ?"
+        where.append(f"{c('updated_at')} > ?")
         args.append(since)
     if folder_id:
-        sql += " AND folder_id = ?"
+        where.append(f"{c('folder_id')} = ?")
         args.append(folder_id)
-    if q:
-        like = f"%{_like_escape(q)}%"
-        sql += " AND (title LIKE ? ESCAPE '\\' OR plaintext LIKE ? ESCAPE '\\')"
-        args += [like, like]
     if favorite is not None:
-        sql += " AND favorite = ?"
+        where.append(f"{c('favorite')} = ?")
         args.append(1 if favorite else 0)
+    if pinned is not None:
+        where.append(f"{c('pinned')} = ?")
+        args.append(1 if pinned else 0)
+    # archived defaults to hidden; archived=true shows only archived
+    where.append(f"{c('archived')} = ?")
+    args.append(1 if archived else 0)
     if has_reminder is not None:
-        sql += " AND reminder_at IS NOT NULL" if has_reminder else " AND reminder_at IS NULL"
+        where.append(f"{c('reminder_at')} IS NOT NULL" if has_reminder
+                     else f"{c('reminder_at')} IS NULL")
     if reminder_before:
-        sql += " AND reminder_at IS NOT NULL AND reminder_at <= ?"
+        where.append(f"{c('reminder_at')} IS NOT NULL AND {c('reminder_at')} <= ?")
         args.append(reminder_before)
-    sql += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+    sql = f"SELECT n.* FROM {from_clause} WHERE {' AND '.join(where)}"
+    sql += f" ORDER BY {order} LIMIT ? OFFSET ?"
     args += [limit + 1, cursor]
     with lock:
         rows = get_conn().execute(sql, args).fetchall()
@@ -203,11 +220,12 @@ def create_note(payload: NoteCreate):
         conn = get_conn()
         conn.execute(
             "INSERT INTO notes (id, title, body, plaintext, folder_id, tags,"
-            " favorite, revision, created_at, updated_at, deleted_at, reminder_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?)",
+            " favorite, pinned, archived, revision, created_at, updated_at, deleted_at, reminder_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 1, ?, ?, NULL, ?)",
             (nid, title, json.dumps(payload.body), extract_plaintext(payload.body),
-             payload.folder_id, json.dumps(payload.tags), now, now,
-             payload.reminder_at),
+             payload.folder_id, json.dumps(payload.tags),
+             1 if payload.pinned else 0, 1 if payload.archived else 0,
+             now, now, payload.reminder_at),
         )
         conn.execute(
             "INSERT INTO revisions (note_id, revision, body, updated_at) VALUES (?, 1, ?, ?)",
@@ -243,13 +261,16 @@ def update_note(nid: str, payload: NoteUpdate):
         tags = payload.tags if "tags" in fs else json.loads(row["tags"])
         favorite = payload.favorite if "favorite" in fs else bool(row["favorite"])
         reminder_at = payload.reminder_at if "reminder_at" in fs else row["reminder_at"]
+        pinned = payload.pinned if "pinned" in fs else bool(row["pinned"])
+        archived = payload.archived if "archived" in fs else bool(row["archived"])
         new_rev = row["revision"] + 1
         conn.execute(
             "UPDATE notes SET title=?, body=?, plaintext=?, folder_id=?, tags=?,"
-            " favorite=?, revision=?, updated_at=?, reminder_at=? WHERE id=?",
+            " favorite=?, pinned=?, archived=?, revision=?, updated_at=?, reminder_at=? WHERE id=?",
             (title, json.dumps(payload.body), extract_plaintext(payload.body),
              folder_id, json.dumps(tags),
-             1 if favorite else 0, new_rev, now, reminder_at, nid),
+             1 if favorite else 0, 1 if pinned else 0, 1 if archived else 0,
+             new_rev, now, reminder_at, nid),
         )
         conn.execute(
             "INSERT INTO revisions (note_id, revision, body, updated_at) VALUES (?, ?, ?, ?)",
@@ -294,6 +315,12 @@ def patch_note(nid: str, payload: NotePatch):
             _check_reminder(payload.reminder_at)
             fields.append("reminder_at=?")
             args.append(payload.reminder_at)
+        if "pinned" in fs and payload.pinned is not None:
+            fields.append("pinned=?")
+            args.append(1 if payload.pinned else 0)
+        if "archived" in fs and payload.archived is not None:
+            fields.append("archived=?")
+            args.append(1 if payload.archived else 0)
         if not fields:
             raise HTTPException(400, "nothing to update")
         new_rev = row["revision"] + 1
@@ -339,6 +366,67 @@ def restore_note(nid: str):
         conn.execute(
             "UPDATE notes SET deleted_at=NULL, updated_at=?, revision=revision+1 WHERE id=?",
             (now, nid),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+    return note_to_dict(row)
+
+
+@app.get("/api/v1/notes/{nid}/revisions", dependencies=[Depends(require_auth)])
+def list_revisions(nid: str):
+    """Version history (metadata only). The server keeps the last 50."""
+    with lock:
+        conn = get_conn()
+        if conn.execute("SELECT id FROM notes WHERE id=?", (nid,)).fetchone() is None:
+            raise HTTPException(404, "note not found")
+        rows = conn.execute(
+            "SELECT revision, updated_at FROM revisions WHERE note_id=? ORDER BY revision DESC",
+            (nid,),
+        ).fetchall()
+    return {"revisions": [{"revision": r["revision"], "updated_at": r["updated_at"]}
+                          for r in rows]}
+
+
+@app.get("/api/v1/notes/{nid}/revisions/{rev}", dependencies=[Depends(require_auth)])
+def get_revision(nid: str, rev: int):
+    with lock:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT revision, body, updated_at FROM revisions WHERE note_id=? AND revision=?",
+            (nid, rev),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(404, "revision not found")
+    return {"revision": row["revision"], "body": json.loads(row["body"]),
+            "updated_at": row["updated_at"]}
+
+
+@app.post("/api/v1/notes/{nid}/revisions/{rev}/restore", dependencies=[Depends(require_auth)])
+def restore_revision(nid: str, rev: int):
+    """Restore an old revision's body as a NEW revision (history is never rewritten)."""
+    now = utcnow()
+    with lock:
+        conn = get_conn()
+        row = _get_live_note(nid)
+        old = conn.execute(
+            "SELECT body FROM revisions WHERE note_id=? AND revision=?", (nid, rev)
+        ).fetchone()
+        if old is None:
+            raise HTTPException(404, "revision not found")
+        new_rev = row["revision"] + 1
+        body = json.loads(old["body"])
+        conn.execute(
+            "UPDATE notes SET body=?, plaintext=?, title=?, revision=?, updated_at=? WHERE id=?",
+            (old["body"], extract_plaintext(body), derive_title(body), new_rev, now, nid),
+        )
+        conn.execute(
+            "INSERT INTO revisions (note_id, revision, body, updated_at) VALUES (?, ?, ?, ?)",
+            (nid, new_rev, old["body"], now),
+        )
+        conn.execute(
+            "DELETE FROM revisions WHERE note_id=? AND revision <="
+            " (SELECT COALESCE(MAX(revision), 0) - 50 FROM revisions WHERE note_id=?)",
+            (nid, nid),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()

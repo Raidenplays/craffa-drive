@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS notes (
     folder_id TEXT,
     tags TEXT NOT NULL DEFAULT '[]',
     favorite INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
     revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -51,6 +53,18 @@ CREATE TABLE IF NOT EXISTS revisions (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (note_id, revision)
 );
+-- Full-text search index over notes (kept in sync by triggers below).
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(title, plaintext, content='notes', content_rowid='rowid');
+CREATE TRIGGER IF NOT EXISTS notes_fts_ai AFTER INSERT ON notes BEGIN
+  INSERT INTO notes_fts(rowid, title, plaintext) VALUES (new.rowid, new.title, new.plaintext);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_fts_au AFTER UPDATE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, title, plaintext) VALUES ('delete', old.rowid, old.title, old.plaintext);
+  INSERT INTO notes_fts(rowid, title, plaintext) VALUES (new.rowid, new.title, new.plaintext);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_fts_ad AFTER DELETE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, title, plaintext) VALUES ('delete', old.rowid, old.title, old.plaintext);
+END;
 """
 
 
@@ -65,9 +79,20 @@ def get_conn() -> sqlite3.Connection:
 def init_db() -> None:
     conn = get_conn()
     with lock:
+        had_fts = conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='notes_fts'"
+        ).fetchone()
         conn.executescript(SCHEMA)
         # lightweight migrations for existing DBs
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)").fetchall()}
-        if "reminder_at" not in cols:
-            conn.execute("ALTER TABLE notes ADD COLUMN reminder_at TEXT")
+        for col, ddl in (("reminder_at", "TEXT"),
+                         ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+                         ("archived", "INTEGER NOT NULL DEFAULT 0")):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE notes ADD COLUMN {col} {ddl}")
+        if not had_fts:
+            # FTS table is new: index any notes that pre-date it.
+            # (COUNT(*) on an external-content FTS table mirrors the content
+            # table, so it can't be used to detect an empty index.)
+            conn.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')")
         conn.commit()

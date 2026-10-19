@@ -8,6 +8,8 @@ class NoteCreate(BaseModel):
     folder_id: str | None = None
     tags: list[str] = []
     reminder_at: str | None = None  # ISO 8601 UTC; None = no reminder
+    pinned: bool = False
+    archived: bool = False
 
 
 class NoteUpdate(BaseModel):
@@ -20,6 +22,8 @@ class NoteUpdate(BaseModel):
     tags: list[str] | None = None
     favorite: bool | None = None
     reminder_at: str | None = None
+    pinned: bool | None = None
+    archived: bool | None = None
 
 
 class NotePatch(BaseModel):
@@ -29,6 +33,8 @@ class NotePatch(BaseModel):
     favorite: bool | None = None
     base_revision: int | None = None  # 409-checked when provided
     reminder_at: str | None = None  # explicit null clears the reminder
+    pinned: bool | None = None
+    archived: bool | None = None
 
 
 class FolderCreate(BaseModel):
