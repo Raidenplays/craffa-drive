@@ -18,7 +18,7 @@ Decided: notes are Word-style rich text (bold, italic, underline, headings, list
 A note body is a JSON document: `{ "blocks": [ … ] }`.
 
 **Top-level block types:** `paragraph`, `heading` (level 1–3), `bullet_list`,
-`ordered_list`, `quote`, `code`, `image`, `divider`.
+`ordered_list`, `check_list`, `quote`, `code`, `image`, `divider`.
 (`list_item` is NOT a top-level block — it only appears inside list `items`
 arrays, as `{"type": "list_item", "spans": [...]}`; the `type` field there is
 informational.)
@@ -29,8 +29,9 @@ informational.)
 `strikethrough`, `code` — except links, which are objects:
 `{"name": "link", "href": "https://…"}`.
 
-**Lists:** `bullet_list` / `ordered_list` hold `items: [{spans: [...]}, …]`
-(non-empty). No nesting in v0.1.
+**Lists:** `bullet_list` / `ordered_list` / `check_list` hold
+`items: [{spans: [...]}, …]` (non-empty). `check_list` items carry
+`checked: bool` (default false). No nesting in v0.1.
 
 Example:
 
@@ -59,7 +60,8 @@ Tables, footnotes, comments, nested lists: deferred past MVP.
 `body` (doc JSON) · `plaintext` (server-extracted, returned in responses for list snippets) ·
 `folder_id` (nullable) · `tags` (string[]) · `favorite` (bool) ·
 `revision` (int, +1 per write) · `created_at` / `updated_at` (ISO 8601 UTC) ·
-`deleted_at` (nullable → trash).
+`deleted_at` (nullable → trash) · `reminder_at` (nullable ISO 8601 UTC —
+a due date/time for the note; notification delivery is client-side in v1).
 
 **Folder:** `id` · `name` · `parent_id` (nullable) · timestamps.
 
@@ -75,21 +77,25 @@ Tables, footnotes, comments, nested lists: deferred past MVP.
   Deletions: poll `GET /notes/trash?since=<ts>` (soft deletes only).
 - Deleting a folder bumps `revision`/`updated_at` on its notes, so a stale
   client PUT can't silently restore a note into the deleted folder.
+- Reminders: any note may carry `reminder_at`. The server stores it and offers
+  `has_reminder` / `reminder_before` list filters; actually notifying the user
+  is the client's job in v1 (poll due reminders, fire a local notification).
 - Last 50 revisions kept server-side (history UI comes later).
 
 ## 5. Endpoints
 
 - `GET /health` → `{ "ok": true, "version": "0.1.0", "api_version": "0.1" }`
   (`api_version` lets clients detect breaking server changes from auto-update)
-- `GET /api/v1/notes?since=&folder_id=&q=&favorite=&limit=&cursor=` — excludes trash by default
-- `POST /api/v1/notes` — `{ title?, body, folder_id?, tags? }`
+- `GET /api/v1/notes?since=&folder_id=&q=&favorite=&has_reminder=&reminder_before=&limit=&cursor=` — excludes trash by default
+- `POST /api/v1/notes` — `{ title?, body, folder_id?, tags?, reminder_at? }`
 - `GET /api/v1/notes/{id}`
 - `PUT /api/v1/notes/{id}` — full body replace:
-  `{ title?, body, base_revision, folder_id?, tags?, favorite? }`.
+  `{ title?, body, base_revision, folder_id?, tags?, favorite?, reminder_at? }`.
   Omitted metadata fields keep their current values (never silently wiped).
 - `PATCH /api/v1/notes/{id}` —
-  `{ title?, folder_id?, tags?, favorite?, base_revision? }`.
-  Explicit `folder_id: null` clears the folder; omitted fields are untouched.
+  `{ title?, folder_id?, tags?, favorite?, reminder_at?, base_revision? }`.
+  Explicit `folder_id: null` clears the folder, explicit `reminder_at: null`
+  clears the reminder; omitted fields are untouched.
 - `DELETE /api/v1/notes/{id}` — soft delete → trash (`?hard=true` purges)
 - `POST /api/v1/notes/{id}/restore`
 - `GET /api/v1/notes/trash?since=&limit=&cursor=`

@@ -15,6 +15,10 @@ def extract_plaintext(doc: dict) -> str:
         elif btype in ("bullet_list", "ordered_list"):
             for item in block.get("items", []) or []:
                 parts.append(_spans_text(item.get("spans")))
+        elif btype == "check_list":
+            for item in block.get("items", []) or []:
+                box = "[x]" if (item.get("checked") if isinstance(item, dict) else False) else "[ ]"
+                parts.append(f"{box} {_spans_text(item.get('spans') if isinstance(item, dict) else [])}")
         elif btype == "image":
             alt = block.get("alt")
             parts.append(f"[image: {alt}]" if alt else "[image]")
@@ -33,7 +37,7 @@ def derive_title(doc: dict) -> str:
 # ---------------------------------------------------------------- validation
 
 BLOCK_TYPES = {"paragraph", "heading", "bullet_list", "ordered_list",
-               "quote", "code", "image", "divider"}
+               "check_list", "quote", "code", "image", "divider"}
 MARKS = {"bold", "italic", "underline", "strikethrough", "code", "link"}
 ALIGNS = {"left", "center", "right"}
 
@@ -68,13 +72,15 @@ def _validate_block(block, where: str) -> str | None:
         if btype == "heading" and block.get("level", 1) not in (1, 2, 3):
             return f"{where}: heading level must be 1-3"
         return _validate_spans(block.get("spans", []), where)
-    if btype in ("bullet_list", "ordered_list"):
+    if btype in ("bullet_list", "ordered_list", "check_list"):
         items = block.get("items")
         if not isinstance(items, list) or not items:
             return f"{where}: list needs a non-empty items array"
         for k, item in enumerate(items):
             if not isinstance(item, dict):
                 return f"{where}.items[{k}]: must be an object"
+            if btype == "check_list" and "checked" in item and not isinstance(item["checked"], bool):
+                return f"{where}.items[{k}]: checked must be a boolean"
             err = _validate_spans(item.get("spans", []), f"{where}.items[{k}]")
             if err:
                 return err

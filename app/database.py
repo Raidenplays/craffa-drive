@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS notes (
     revision INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    deleted_at TEXT
+    deleted_at TEXT,
+    reminder_at TEXT
 );
 CREATE TABLE IF NOT EXISTS attachments (
     id TEXT PRIMARY KEY,
@@ -65,4 +66,8 @@ def init_db() -> None:
     conn = get_conn()
     with lock:
         conn.executescript(SCHEMA)
+        # lightweight migrations for existing DBs
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)").fetchall()}
+        if "reminder_at" not in cols:
+            conn.execute("ALTER TABLE notes ADD COLUMN reminder_at TEXT")
         conn.commit()

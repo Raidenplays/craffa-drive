@@ -74,6 +74,7 @@ def note_to_dict(row) -> dict:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "deleted_at": row["deleted_at"],
+        "reminder_at": row["reminder_at"] if "reminder_at" in row.keys() else None,
     }
 
 
@@ -85,6 +86,15 @@ def check_body(body: dict) -> None:
 
 def _like_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _check_reminder(value: str | None) -> None:
+    if value is None:
+        return
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(422, "reminder_at must be ISO 8601, e.g. 2026-10-20T09:00:00Z")
 
 
 def _conflict(nid: str, row, base_revision: int):
@@ -128,6 +138,8 @@ def list_notes(
     folder_id: str | None = Query(default=None),
     q: str | None = Query(default=None),
     favorite: bool | None = Query(default=None),
+    has_reminder: bool | None = Query(default=None),
+    reminder_before: str | None = Query(default=None),
     limit: int = Query(default=50, le=200),
     cursor: int = Query(default=0, ge=0),
 ):
@@ -146,6 +158,11 @@ def list_notes(
     if favorite is not None:
         sql += " AND favorite = ?"
         args.append(1 if favorite else 0)
+    if has_reminder is not None:
+        sql += " AND reminder_at IS NOT NULL" if has_reminder else " AND reminder_at IS NULL"
+    if reminder_before:
+        sql += " AND reminder_at IS NOT NULL AND reminder_at <= ?"
+        args.append(reminder_before)
     sql += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
     args += [limit + 1, cursor]
     with lock:
@@ -178,6 +195,7 @@ def trash(
 @app.post("/api/v1/notes", dependencies=[Depends(require_auth)], status_code=201)
 def create_note(payload: NoteCreate):
     check_body(payload.body)
+    _check_reminder(payload.reminder_at)
     nid = uuid.uuid4().hex
     now = utcnow()
     title = payload.title or derive_title(payload.body)
@@ -185,10 +203,11 @@ def create_note(payload: NoteCreate):
         conn = get_conn()
         conn.execute(
             "INSERT INTO notes (id, title, body, plaintext, folder_id, tags,"
-            " favorite, revision, created_at, updated_at, deleted_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL)",
+            " favorite, revision, created_at, updated_at, deleted_at, reminder_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL, ?)",
             (nid, title, json.dumps(payload.body), extract_plaintext(payload.body),
-             payload.folder_id, json.dumps(payload.tags), now, now),
+             payload.folder_id, json.dumps(payload.tags), now, now,
+             payload.reminder_at),
         )
         conn.execute(
             "INSERT INTO revisions (note_id, revision, body, updated_at) VALUES (?, 1, ?, ?)",
@@ -208,6 +227,7 @@ def get_note(nid: str):
 @app.put("/api/v1/notes/{nid}", dependencies=[Depends(require_auth)])
 def update_note(nid: str, payload: NoteUpdate):
     check_body(payload.body)
+    _check_reminder(payload.reminder_at if "reminder_at" in payload.model_fields_set else None)
     now = utcnow()
     with lock:
         conn = get_conn()
@@ -222,13 +242,14 @@ def update_note(nid: str, payload: NoteUpdate):
         folder_id = payload.folder_id if "folder_id" in fs else row["folder_id"]
         tags = payload.tags if "tags" in fs else json.loads(row["tags"])
         favorite = payload.favorite if "favorite" in fs else bool(row["favorite"])
+        reminder_at = payload.reminder_at if "reminder_at" in fs else row["reminder_at"]
         new_rev = row["revision"] + 1
         conn.execute(
             "UPDATE notes SET title=?, body=?, plaintext=?, folder_id=?, tags=?,"
-            " favorite=?, revision=?, updated_at=? WHERE id=?",
+            " favorite=?, revision=?, updated_at=?, reminder_at=? WHERE id=?",
             (title, json.dumps(payload.body), extract_plaintext(payload.body),
              folder_id, json.dumps(tags),
-             1 if favorite else 0, new_rev, now, nid),
+             1 if favorite else 0, new_rev, now, reminder_at, nid),
         )
         conn.execute(
             "INSERT INTO revisions (note_id, revision, body, updated_at) VALUES (?, ?, ?, ?)",
@@ -268,6 +289,11 @@ def patch_note(nid: str, payload: NotePatch):
         if "favorite" in fs and payload.favorite is not None:
             fields.append("favorite=?")
             args.append(1 if payload.favorite else 0)
+        if "reminder_at" in fs:
+            # explicit null clears the reminder; omitted keeps it
+            _check_reminder(payload.reminder_at)
+            fields.append("reminder_at=?")
+            args.append(payload.reminder_at)
         if not fields:
             raise HTTPException(400, "nothing to update")
         new_rev = row["revision"] + 1
