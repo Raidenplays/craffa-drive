@@ -20,16 +20,18 @@ jobs:
       - name: Restore Gradle wrapper JAR
         run: base64 -d gradle/wrapper/gradle-wrapper.jar.b64 > gradle/wrapper/gradle-wrapper.jar
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
 
-      - uses: android-actions/setup-android@v3
-
-      - name: Install Android 36 SDK
+      - name: Set up Android SDK
         run: |
-          yes | sdkmanager --licenses > /dev/null
+          SD=/usr/local/lib/android/sdk
+          echo "ANDROID_HOME=$SD" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SD" >> $GITHUB_ENV
+          export PATH="$SD/cmdline-tools/16.0/bin:$PATH"
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
       - uses: gradle/actions/setup-gradle@v4
@@ -44,3 +46,33 @@ jobs:
         with:
           name: craffa-drive-debug
           path: android/app/build/outputs/apk/debug/*.apk
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
