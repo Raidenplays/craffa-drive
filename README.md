@@ -1,7 +1,7 @@
 # Craffa Drive
 
 Your own self-hosted drive for the homelab — notes, photos and files, no cloud.
-FastAPI + SQLite backend. Implements [`craffa-notes-api-spec.md`](../files/craffa-notes-api-spec.md) v0.1.
+FastAPI + SQLite backend. Implements [`craffa-notes-api-spec.md`](docs/craffa-notes-api-spec.md) v0.1.
 
 Python 3.10+.
 

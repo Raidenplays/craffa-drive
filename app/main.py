@@ -13,8 +13,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from . import updater
 from .auth import require_auth
 from .database import ATTACH_DIR, get_conn, init_db, lock
-from .doctext import derive_title, extract_plaintext
-from .schemas import FolderCreate, NoteCreate, NotePatch, NoteUpdate
+from .doctext import derive_title, extract_plaintext, validate_doc
+from .schemas import FolderCreate, FolderUpdate, NoteCreate, NotePatch, NoteUpdate
 
 VERSION = "0.1.0"
 
@@ -78,8 +78,22 @@ def note_to_dict(row) -> dict:
 
 
 def check_body(body: dict) -> None:
-    if not isinstance(body, dict) or not isinstance(body.get("blocks"), list):
-        raise HTTPException(422, 'body must be an object like {"blocks": [...]}')
+    err = validate_doc(body)
+    if err:
+        raise HTTPException(422, err)
+
+
+def _like_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _conflict(nid: str, row, base_revision: int):
+    return JSONResponse(status_code=409, content={
+        "error": {"code": "revision_conflict",
+                  "message": f"base_revision {base_revision}"
+                             f" does not match server revision {row['revision']}"},
+        "server_copy": note_to_dict(row),
+    })
 
 
 def _get_live_note(nid: str):
@@ -93,7 +107,7 @@ def _get_live_note(nid: str):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": VERSION}
+    return {"ok": True, "version": VERSION, "api_version": "0.1"}
 
 
 @app.post("/api/v1/admin/update", dependencies=[Depends(require_auth)])
@@ -126,8 +140,9 @@ def list_notes(
         sql += " AND folder_id = ?"
         args.append(folder_id)
     if q:
-        sql += " AND (title LIKE ? OR plaintext LIKE ?)"
-        args += [f"%{q}%", f"%{q}%"]
+        like = f"%{_like_escape(q)}%"
+        sql += " AND (title LIKE ? ESCAPE '\\' OR plaintext LIKE ? ESCAPE '\\')"
+        args += [like, like]
     if favorite is not None:
         sql += " AND favorite = ?"
         args.append(1 if favorite else 0)
@@ -144,17 +159,20 @@ def list_notes(
 def trash(
     since: str | None = Query(default=None),
     limit: int = Query(default=50, le=200),
+    cursor: int = Query(default=0, ge=0),
 ):
     sql = "SELECT * FROM notes WHERE deleted_at IS NOT NULL"
     args: list = []
     if since:
         sql += " AND deleted_at > ?"
         args.append(since)
-    sql += " ORDER BY deleted_at DESC LIMIT ?"
-    args.append(limit)
+    sql += " ORDER BY deleted_at DESC LIMIT ? OFFSET ?"
+    args += [limit + 1, cursor]
     with lock:
         rows = get_conn().execute(sql, args).fetchall()
-    return {"notes": [note_to_dict(r) for r in rows]}
+    notes = [note_to_dict(r) for r in rows[:limit]]
+    next_cursor = cursor + limit if len(rows) > limit else None
+    return {"notes": notes, "next_cursor": next_cursor}
 
 
 @app.post("/api/v1/notes", dependencies=[Depends(require_auth)], status_code=201)
@@ -195,20 +213,22 @@ def update_note(nid: str, payload: NoteUpdate):
         conn = get_conn()
         row = _get_live_note(nid)
         if row["revision"] != payload.base_revision:
-            return JSONResponse(status_code=409, content={
-                "error": {"code": "revision_conflict",
-                          "message": f"base_revision {payload.base_revision}"
-                                     f" does not match server revision {row['revision']}"},
-                "server_copy": note_to_dict(row),
-            })
-        title = payload.title or derive_title(payload.body)
+            return _conflict(nid, row, payload.base_revision)
+        # Omitted metadata fields keep their current values (never wiped).
+        fs = payload.model_fields_set
+        title = payload.title if "title" in fs else row["title"]
+        if title is None:
+            title = derive_title(payload.body)
+        folder_id = payload.folder_id if "folder_id" in fs else row["folder_id"]
+        tags = payload.tags if "tags" in fs else json.loads(row["tags"])
+        favorite = payload.favorite if "favorite" in fs else bool(row["favorite"])
         new_rev = row["revision"] + 1
         conn.execute(
             "UPDATE notes SET title=?, body=?, plaintext=?, folder_id=?, tags=?,"
             " favorite=?, revision=?, updated_at=? WHERE id=?",
             (title, json.dumps(payload.body), extract_plaintext(payload.body),
-             payload.folder_id, json.dumps(payload.tags),
-             1 if payload.favorite else 0, new_rev, now, nid),
+             folder_id, json.dumps(tags),
+             1 if favorite else 0, new_rev, now, nid),
         )
         conn.execute(
             "INSERT INTO revisions (note_id, revision, body, updated_at) VALUES (?, ?, ?, ?)",
@@ -230,18 +250,22 @@ def patch_note(nid: str, payload: NotePatch):
     with lock:
         conn = get_conn()
         row = _get_live_note(nid)
+        if payload.base_revision is not None and row["revision"] != payload.base_revision:
+            return _conflict(nid, row, payload.base_revision)
+        fs = payload.model_fields_set
         fields: list[str] = []
         args: list = []
-        if payload.title is not None:
+        if "title" in fs and payload.title is not None:
             fields.append("title=?")
             args.append(payload.title)
-        if payload.folder_id is not None:
+        if "folder_id" in fs:
+            # explicit null clears the folder; omitted keeps it
             fields.append("folder_id=?")
             args.append(payload.folder_id)
-        if payload.tags is not None:
+        if "tags" in fs and payload.tags is not None:
             fields.append("tags=?")
             args.append(json.dumps(payload.tags))
-        if payload.favorite is not None:
+        if "favorite" in fs and payload.favorite is not None:
             fields.append("favorite=?")
             args.append(1 if payload.favorite else 0)
         if not fields:
@@ -329,11 +353,31 @@ def delete_folder(fid: str):
         conn = get_conn()
         if conn.execute("SELECT id FROM folders WHERE id=?", (fid,)).fetchone() is None:
             raise HTTPException(404, "folder not found")
-        conn.execute("UPDATE notes SET folder_id=NULL, updated_at=? WHERE folder_id=?", (now, fid))
+        # Notes keep working: unfile them AND bump their revision so a stale
+        # client PUT can't silently restore them into the deleted folder.
+        conn.execute(
+            "UPDATE notes SET folder_id=NULL, updated_at=?, revision=revision+1"
+            " WHERE folder_id=?", (now, fid))
         conn.execute("UPDATE folders SET parent_id=NULL WHERE parent_id=?", (fid,))
         conn.execute("DELETE FROM folders WHERE id=?", (fid,))
         conn.commit()
     return {"ok": True}
+
+
+@app.put("/api/v1/folders/{fid}", dependencies=[Depends(require_auth)])
+def rename_folder(fid: str, payload: FolderUpdate):
+    now = utcnow()
+    with lock:
+        conn = get_conn()
+        row = conn.execute("SELECT * FROM folders WHERE id=?", (fid,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "folder not found")
+        conn.execute("UPDATE folders SET name=?, updated_at=? WHERE id=?",
+                     (payload.name, now, fid))
+        conn.commit()
+        row = conn.execute("SELECT * FROM folders WHERE id=?", (fid,)).fetchone()
+    return {"id": row["id"], "name": row["name"], "parent_id": row["parent_id"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"]}
 
 
 # ---------------------------------------------------------------- attachments
