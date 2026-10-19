@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.raiden.craffa"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.raiden.craffa"
